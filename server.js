@@ -51,7 +51,7 @@ app.get("/", async (req, res) => {
     };
 
     res.setHeader("Content-Type", "application/geo+json");
-    res.setHeader("Content-Disposition", 'inline; filename="Bay Area Church Networks.geojson"');
+    res.setHeader("Content-Disposition", 'inline; filename="TBC Networks.geojson"');
     res.json(geojson);
   } catch (e) {
     console.error(e);
