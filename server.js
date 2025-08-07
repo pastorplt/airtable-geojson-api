@@ -45,7 +45,14 @@ app.get("/", async (req, res) => {
       }
     }).filter(Boolean);
 
-    res.json({ type: "FeatureCollection", features });
+    const geojson = {
+      type: "FeatureCollection",
+      features
+    };
+
+    res.setHeader("Content-Type", "application/geo+json");
+    res.setHeader("Content-Disposition", 'inline; filename="Bay Area Church Networks.geojson"');
+    res.json(geojson);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Failed to fetch data from Airtable" });
