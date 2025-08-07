@@ -34,8 +34,8 @@ app.get("/", async (req, res) => {
           type: "Feature",
           geometry,
           properties: {
-            name: r.fields["Name"] || "",
-            network: r.fields["Network"] || ""
+            name: r.fields["Network Name"] || "",
+            network: r.fields["Network Leaders"] || ""
           }
         };
       } catch {
