@@ -35,7 +35,9 @@ app.get("/", async (req, res) => {
           geometry,
           properties: {
             Network: r.fields["Network Name"] || "",
-            Leaders: r.fields["Network Leader Names"] || ""
+            Leaders: Array.isArray(r.fields["Network Leader Names"])
+              ? r.fields["Network Leader Names"].join(", ")
+              : r.fields["Network Leader Names"] || ""
           }
         };
       } catch {
