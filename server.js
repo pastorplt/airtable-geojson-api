@@ -41,6 +41,8 @@ app.get("/", async (req, res) => {
           }
         };
       } catch {
+        console.warn(`⚠️ Invalid polygon in record ${r.id}: ${err.message}`);
+        console.warn("Raw field value:", r.fields["Polygon"]);
         return null;
       }
     }).filter(Boolean);
