@@ -42,7 +42,7 @@ app.get("/", async (req, res) => {
         };
       } catch (err) {
         console.warn(`⚠️ Invalid polygon in record ${r.id}: ${err.message}`);
-        console.warn("Raw field value:", r.fields["Polygon"]);
+        console.warn("Network:", r.fields["Network Name"]);
         return null;
       }
     }).filter(Boolean);
