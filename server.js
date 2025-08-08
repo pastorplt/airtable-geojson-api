@@ -40,7 +40,7 @@ app.get("/", async (req, res) => {
               : r.fields["Network Leader Names"] || ""
           }
         };
-      } catch {
+      } catch (err) {
         console.warn(`⚠️ Invalid polygon in record ${r.id}: ${err.message}`);
         console.warn("Raw field value:", r.fields["Polygon"]);
         return null;
