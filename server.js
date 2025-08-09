@@ -52,98 +52,18 @@ function parseGeometry(raw) {
   }
 }
 
-/** Prefer Airtable thumbnail if present, else original URL. */
+/** Prefer Airtable thumbnail if present, else original URL. Accepts strings too. */
 function pickAttachmentUrl(att) {
+  if (!att) return null;
+  if (typeof att === 'string') {
+    return /^https?:\/\//i.test(att) ? att : null;
+  }
   return att?.thumbnails?.large?.url || att?.thumbnails?.full?.url || att?.url || null;
 }
 
-/** Normalize "Network Leaders Names" into a single comma-separated string (no brackets/quotes/IDs). */
-function normalizeLeaders(value) {
-  let parts = [];
-
-  const pushClean = (s) => {
-    if (s == null) return;
-    let t = String(s).trim();
-    // Strip surrounding quotes/brackets
-    t = t.replace(/^(\[|\]+|"+|'+)|(\[|\]+|"+|'+)$/g, '');
-    // Collapse whitespace
-    t = t.replace(/\s+/g, ' ').trim();
-    // Drop Airtable record IDs like recXXXXXXXXXXXXXX
-    if (/^rec[a-zA-Z0-9]{14}$/.test(t)) return;
-    if (t) parts.push(t);
-  };
-
-  if (Array.isArray(value)) {
-    value.forEach((v) => {
-      if (typeof v === 'object' && v && 'name' in v) {
-        pushClean(v.name);
-      } else if (typeof v === 'string' && v.includes('","')) {
-        // Looks like a flattened JSON array: "A","B"
-        v.split('","').forEach(x => pushClean(x.replace(/^"+|"+$/g, '')));
-      } else {
-        pushClean(v);
-      }
-    });
-  } else if (typeof value === 'string') {
-    const text = value.trim();
-    try {
-      if (text.startsWith('[') && text.endsWith(']')) {
-        const parsed = JSON.parse(text);
-        if (Array.isArray(parsed)) parsed.forEach(pushClean);
-        else pushClean(parsed);
-      } else {
-        text.split(/[;,]/).forEach(s => pushClean(s));
-      }
-    } catch {
-      text.split(/[;,]/).forEach(s => pushClean(s));
-    }
-  } else if (value != null) {
-    pushClean(value);
-  }
-
-  // unique + join
-  const unique = [...new Set(parts)];
-  return unique.join(', ');
-}
-
-/** Main endpoint Felt points at */
-app.get('/networks.geojson', async (_req, res) => {
-  try {
-    const networkRecords = await fetchAllRecords(NETWORKS_TABLE_NAME);
-
-    const features = networkRecords.map((r) => {
-      const f = r.fields || {};
-      const geometry = parseGeometry(f['Polygon']);
-      if (!geometry) return null;
-
-      const leadersString = normalizeLeaders(f['Network Leaders Names']) || '';
-
-      // Keep raw photo URLs as data (no Markdown)
-      const photos = Array.isArray(f['Photo']) ? f['Photo'] : [];
-      const photoUrls = photos.map(pickAttachmentUrl).filter(Boolean);
-
-      return {
-        type: 'Feature',
-        geometry,
-        properties: {
-          id: r.id,
-          name: f['Network Name'] ?? '',
-          leaders: leadersString,   // always a single comma-separated string
-          photos: photoUrls,        // plain URLs (array); not used as Markdown
-        },
-      };
-    }).filter(Boolean);
-
-    res.set('Cache-Control', 'public, max-age=300'); // 5 minutes
-    res.json({ type: 'FeatureCollection', features });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: String(err?.message || err) });
-  }
-});
-
-app.get('/', (_req, res) => res.send('OK'));
-
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+/** Normalize weird slashes and leading encodings in a URL string. */
+function normalizeUrl(u) {
+  let s = String(u || '').trim();
+  // Remove leading encoded spaces like "%20"
+  s = s.replace(/^%20+/i, '').replace(/^\s+/, '');
+  // Ensure protocol has e
