@@ -6,8 +6,8 @@ import cors from 'cors';
 const {
   AIRTABLE_TOKEN,
   AIRTABLE_BASE_ID,
-  NETWORKS_TABLE_NAME, // e.g., "Networks"
-  AIRTABLE_VIEW_NAME,  // optional, e.g., "Grid view"
+  NETWORKS_TABLE_NAME,      // e.g., "Networks"
+  AIRTABLE_VIEW_NAME,       // optional, e.g., "Grid view"
   PORT = 3000,
 } = process.env;
 
@@ -52,9 +52,9 @@ function parseGeometry(raw) {
   }
 }
 
-/** Escape Markdown special characters in text. */
-function escapeMarkdown(text) {
-  return String(text).replace(/([\\`*_{}[\]()#+\-.!])/g, '\\$1');
+/** Minimal HTML escape to keep popups safe. */
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 /** Prefer Airtable thumbnail if present, else original URL. */
@@ -62,26 +62,30 @@ function pickAttachmentUrl(att) {
   return att?.thumbnails?.large?.url || att?.thumbnails?.full?.url || att?.url || null;
 }
 
-/** Build Felt-safe Markdown description. */
-function buildMarkdownDescription(fields) {
+/** Build popup HTML + Markdown description using Lookup "Photo". */
+function buildPopupAndDescription(fields) {
   const name = fields['Network Name'] ?? '';
-  const leadersField = fields['Network Leaders Names'];
+  const leadersField = fields['Network Leaders Names']; // can be array or text
   const leaderText = Array.isArray(leadersField) ? leadersField.join(', ') : (leadersField ?? '');
 
-  const photos = Array.isArray(fields['Photo']) ? fields['Photo'] : [];
+  const photos = Array.isArray(fields['Photo']) ? fields['Photo'] : []; // Lookup of attachments
   const photoUrls = photos.map(pickAttachmentUrl).filter(Boolean);
 
-  let md = `**${escapeMarkdown(name)}**`;
-  if (leaderText) md += `\n\n${escapeMarkdown(leaderText)}`;
+  let popup = `<strong>${escapeHtml(name)}</strong>`;
+  if (leaderText) popup += `<br>${escapeHtml(leaderText)}`;
   photoUrls.forEach((url) => {
-    md += `\n\n![Leader photo](${url})`;
+    popup += `<br><img src="${url}" alt="Leader photo" style="max-width:150px;border-radius:6px;">`;
   });
 
-  return md;
+  let description = `**${name}**`;
+  if (leaderText) description += `\n\n${leaderText}`;
+  photoUrls.forEach((url) => { description += `\n\n![Leader photo](${url})`; });
+
+  return { popup, description, photoUrls };
 }
 
-/** Main endpoint Felt points at */
-app.get('/networks.geojson', async (_req, res) => {
+/** Main endpoint Felt points at (e.g., https://your-app.onrender.com/networks.geojson) */
+app.get('/networks.geojson', async (req, res) => {
   try {
     const networkRecords = await fetchAllRecords(NETWORKS_TABLE_NAME);
 
@@ -90,7 +94,7 @@ app.get('/networks.geojson', async (_req, res) => {
       const geometry = parseGeometry(f['Polygon']);
       if (!geometry) return null;
 
-      const description = buildMarkdownDescription(f);
+      const { popup, description, photoUrls } = buildPopupAndDescription(f);
 
       return {
         type: 'Feature',
@@ -99,7 +103,9 @@ app.get('/networks.geojson', async (_req, res) => {
           id: r.id,
           name: f['Network Name'] ?? '',
           leaders: f['Network Leaders Names'] ?? [],
-          description, // Markdown only — works in Felt popups
+          photos: photoUrls,      // handy for debugging/QA
+          popup,                  // HTML popup (Felt supports)
+          description,            // Markdown description (Felt also supports)
         },
       };
     }).filter(Boolean);
