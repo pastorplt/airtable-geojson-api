@@ -55,21 +55,16 @@ function parseGeometry(raw) {
 /** Prefer Airtable thumbnail if present, else original URL. Accepts strings too. */
 function pickAttachmentUrl(att) {
   if (!att) return null;
-  if (typeof att === 'string') {
-    return /^https?:\/\//i.test(att) ? att : null;
-  }
+  if (typeof att === 'string') return /^https?:\/\//i.test(att) ? att : null;
   return att?.thumbnails?.large?.url || att?.thumbnails?.full?.url || att?.url || null;
 }
 
 /** Normalize weird slashes and leading encodings in a URL string. */
 function normalizeUrl(u) {
   let s = String(u || '').trim();
-  // Remove leading encoded spaces like "%20"
-  s = s.replace(/^%20+/i, '').replace(/^\s+/, '');
-  // Ensure protocol has exactly two slashes (https://// -> https://)
-  s = s.replace(/^(https?:)\/{2,}/i, (_, p1) => `${p1}//`);
-  // Collapse any remaining multiple slashes NOT immediately after a colon
-  s = s.replace(/([^:])\/{2,}/g, '$1/');
+  s = s.replace(/^%20+/i, '').replace(/^\s+/, '');          // trim encoded/real spaces
+  s = s.replace(/^(https?:)\/{2,}/i, (_, p1) => `${p1}//`); // https://// -> https://
+  s = s.replace(/([^:])\/{2,}/g, '$1/');                    // collapse extra slashes in path
   return s;
 }
 
@@ -83,29 +78,24 @@ function collectPhotoUrls(value) {
   const pushAny = (v) => {
     if (v == null) return;
 
-    // Nested arrays (lookups often yield arrays of arrays)
     if (Array.isArray(v)) {
       v.forEach(pushAny);
       return;
     }
 
-    // Strings: could be direct URL, JSON-encoded array/object, or a comma-joined list
     if (typeof v === 'string') {
       const s = v.trim();
 
-      // If it looks like JSON (["...","..."] or {"url":...}), parse then recurse
+      // JSON array/object encoded as string
       if ((s.startsWith('[') && s.endsWith(']')) || (s.startsWith('{') && s.endsWith('}'))) {
         try {
           const parsed = JSON.parse(s);
           pushAny(parsed);
           return;
-        } catch {
-          // fall through to splitting logic
-        }
+        } catch { /* fall through */ }
       }
 
-      // If multiple URLs got jammed into a single string, split on commas
-      // (we handle "%20" before comma separately, trim later)
+      // Comma-joined URLs in one string
       const parts = s.includes(',') ? s.split(',') : [s];
       parts.forEach((part) => {
         const maybe = pickAttachmentUrl(part);
@@ -114,16 +104,13 @@ function collectPhotoUrls(value) {
       return;
     }
 
-    // Objects: attachment objects or arbitrary shapes
     if (typeof v === 'object') {
       if (v.url || v.thumbnails) {
         const maybe = pickAttachmentUrl(v);
         if (maybe) urls.add(normalizeUrl(maybe));
         return;
       }
-      // Scan nested properties
       Object.values(v).forEach(pushAny);
-      return;
     }
   };
 
@@ -138,24 +125,18 @@ function normalizeLeaders(value) {
   const pushClean = (s) => {
     if (s == null) return;
     let t = String(s).trim();
-    // Strip surrounding quotes/brackets
-    t = t.replace(/^(\[|\]+|"+|'+)|(\[|\]+|"+|'+)$/g, '');
-    // Collapse whitespace
-    t = t.replace(/\s+/g, ' ').trim();
-    // Drop Airtable record IDs like recXXXXXXXXXXXXXX
-    if (/^rec[a-zA-Z0-9]{14}$/.test(t)) return;
+    t = t.replace(/^(\[|\]+|"+|'+)|(\[|\]+|"+|'+)$/g, ''); // strip quotes/brackets
+    t = t.replace(/\s+/g, ' ').trim();                    // collapse whitespace
+    if (/^rec[a-zA-Z0-9]{14}$/.test(t)) return;           // drop Airtable record IDs
     if (t) parts.push(t);
   };
 
   if (Array.isArray(value)) {
     value.forEach((v) => {
-      if (typeof v === 'object' && v && 'name' in v) {
-        pushClean(v.name);
-      } else if (typeof v === 'string' && v.includes('","')) {
+      if (typeof v === 'object' && v && 'name' in v) pushClean(v.name);
+      else if (typeof v === 'string' && v.includes('","')) {
         v.split('","').forEach(x => pushClean(x.replace(/^"+|"+$/g, '')));
-      } else {
-        pushClean(v);
-      }
+      } else pushClean(v);
     });
   } else if (typeof value === 'string') {
     const text = value.trim();
@@ -173,7 +154,6 @@ function normalizeLeaders(value) {
     pushClean(value);
   }
 
-  // Unique + join
   return [...new Set(parts)].join(', ');
 }
 
@@ -189,9 +169,12 @@ app.get('/networks.geojson', async (_req, res) => {
 
       const leaders = normalizeLeaders(f['Network Leaders Names']) || '';
 
-      // Collect and normalize photo URLs (robust against all Airtable/lookup shapes)
-      const photos = collectPhotoUrls(f['Photo']);
-      const photo = photos[0] || '';
+      // Collect, normalize, de-dup, and cap to 6 photos
+      const urls = collectPhotoUrls(f['Photo']).map(normalizeUrl);
+      const unique = [...new Set(urls)].slice(0, 6);
+
+      const [photo1 = '', photo2 = '', photo3 = '', photo4 = '', photo5 = '', photo6 = ''] = unique;
+      const photo_count = unique.filter(Boolean).length;
 
       return {
         type: 'Feature',
@@ -199,9 +182,14 @@ app.get('/networks.geojson', async (_req, res) => {
         properties: {
           id: r.id,
           name: f['Network Name'] ?? '',
-          leaders,  // single comma-separated string
-          photo,    // first URL (string)
-          photos,   // array of clean URL strings
+          leaders,        // single comma-separated string
+          photo1,
+          photo2,
+          photo3,
+          photo4,
+          photo5,
+          photo6,
+          photo_count,    // integer 0..6
         },
       };
     }).filter(Boolean);
