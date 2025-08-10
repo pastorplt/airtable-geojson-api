@@ -41,6 +41,14 @@ async function fetchAllRecords(tableName) {
   return all;
 }
 
+/** Fetch a single record by ID. */
+async function fetchRecordById(tableName, recordId) {
+  const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(tableName)}/${recordId}`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` } });
+  if (!res.ok) throw new Error(`Airtable error ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
 /** Parse a GeoJSON string or object safely. */
 function parseGeometry(raw) {
   if (!raw) return null;
@@ -68,10 +76,7 @@ function normalizeUrl(u) {
   return s;
 }
 
-/**
- * Flatten anything Airtable might return for a lookup/attachment field into an array of clean URL strings.
- * Handles: attachment arrays, nested arrays, objects, JSON-encoded strings, and comma-joined strings.
- */
+/** Flatten anything Airtable might return for a lookup/attachment field into an array of clean URL strings. */
 function collectPhotoUrls(value) {
   const urls = new Set();
 
@@ -118,7 +123,7 @@ function collectPhotoUrls(value) {
   return Array.from(urls);
 }
 
-/** Normalize "Network Leaders Names" into a single comma-separated string (no brackets/quotes/IDs). */
+/** Normalize "Network Leaders Names" into a single comma-separated string. */
 function normalizeLeaders(value) {
   const parts = [];
 
@@ -157,9 +162,70 @@ function normalizeLeaders(value) {
   return [...new Set(parts)].join(', ');
 }
 
-/** Main endpoint Felt points at */
-app.get('/networks.geojson', async (_req, res) => {
+/** Figure out the absolute base URL for proxy links. */
+function getBaseUrl(req) {
+  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+  const host = req.headers['x-forwarded-host'] || req.get('host');
+  return `${proto}://${host}`;
+}
+
+/* ---------------- Image proxy (prevents expired Airtable links) ----------------
+   - We proxy ONLY when the Photo field is an attachment array (objects with url/thumbnails).
+   - For plain string URLs (e.g., S3/Cloudinary), we pass them through unchanged.
+----------------------------------------------------------------------------- */
+
+/** Very short-lived in-memory cache of fresh Airtable attachment URLs. */
+const urlCache = new Map(); // key: `${recordId}:${index}` -> { url, expiresAt }
+const CACHE_TTL_MS = 8 * 60 * 1000; // 8 minutes
+
+function getCached(key) {
+  const v = urlCache.get(key);
+  if (!v) return null;
+  if (Date.now() > v.expiresAt) {
+    urlCache.delete(key);
+    return null;
+  }
+  return v.url;
+}
+function setCached(key, url) {
+  urlCache.set(key, { url, expiresAt: Date.now() + CACHE_TTL_MS });
+}
+
+/** Redirect to a fresh Airtable attachment URL for Photo[index]. */
+app.get('/img/:recordId/:index', async (req, res) => {
   try {
+    const { recordId, index } = req.params;
+    const idx = Number(index);
+    if (!Number.isInteger(idx) || idx < 0) return res.status(400).send('Bad index');
+
+    const cacheKey = `${recordId}:${idx}`;
+    const cached = getCached(cacheKey);
+    if (cached) {
+      res.set('Cache-Control', 'public, max-age=300');
+      return res.redirect(302, cached);
+    }
+
+    const rec = await fetchRecordById(NETWORKS_TABLE_NAME, recordId);
+    const attachments = Array.isArray(rec.fields?.Photo) ? rec.fields.Photo : [];
+    const att = attachments[idx];
+    if (!att) return res.status(404).send('Photo not found');
+
+    const freshUrl = pickAttachmentUrl(att);
+    if (!freshUrl) return res.status(404).send('Photo URL missing');
+
+    setCached(cacheKey, freshUrl);
+    res.set('Cache-Control', 'public, max-age=300');
+    return res.redirect(302, freshUrl);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send('Image proxy error');
+  }
+});
+
+/** Main endpoint Felt points at */
+app.get('/networks.geojson', async (req, res) => {
+  try {
+    const baseUrl = getBaseUrl(req);
     const networkRecords = await fetchAllRecords(NETWORKS_TABLE_NAME);
 
     const features = networkRecords.map((r) => {
@@ -169,12 +235,27 @@ app.get('/networks.geojson', async (_req, res) => {
 
       const leaders = normalizeLeaders(f['Network Leaders Names']) || '';
 
-      // Collect, normalize, de-dup, and cap to 6 photos
-      const urls = collectPhotoUrls(f['Photo']).map(normalizeUrl);
-      const unique = [...new Set(urls)].slice(0, 6);
+      // If Photo is an attachment array (objects), build proxied URLs by index.
+      let photoUrls = [];
+      const photoField = f['Photo'];
+      const isAttachmentArray =
+        Array.isArray(photoField) &&
+        photoField.length > 0 &&
+        typeof photoField[0] === 'object' &&
+        (photoField[0]?.url || photoField[0]?.thumbnails);
 
-      const [photo1 = '', photo2 = '', photo3 = '', photo4 = '', photo5 = '', photo6 = ''] = unique;
-      const photo_count = unique.filter(Boolean).length;
+      if (isAttachmentArray) {
+        photoUrls = photoField
+          .slice(0, 6)
+          .map((_, idx) => `${baseUrl}/img/${r.id}/${idx}`);
+      } else {
+        // Fallback: collect plain URLs from whatever is in Photo (these may be permanent)
+        const urls = collectPhotoUrls(photoField).map(normalizeUrl);
+        photoUrls = [...new Set(urls)].slice(0, 6);
+      }
+
+      const [photo1 = '', photo2 = '', photo3 = '', photo4 = '', photo5 = '', photo6 = ''] = photoUrls;
+      const photo_count = photoUrls.filter(Boolean).length;
 
       return {
         type: 'Feature',
