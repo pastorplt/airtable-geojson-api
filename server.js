@@ -6,8 +6,8 @@ import cors from 'cors';
 const {
   AIRTABLE_TOKEN,
   AIRTABLE_BASE_ID,
-  NETWORKS_TABLE_NAME, // e.g., "Networks"
-  AIRTABLE_VIEW_NAME,  // optional, e.g., "Grid view"
+  NETWORKS_TABLE_NAME,
+  AIRTABLE_VIEW_NAME,
   PORT = 3000,
 } = process.env;
 
@@ -60,7 +60,7 @@ function parseGeometry(raw) {
   }
 }
 
-/** Prefer Airtable thumbnail if present, else original URL. Accepts strings too. */
+/** Prefer Airtable thumbnail if present, else original URL. */
 function pickAttachmentUrl(att) {
   if (!att) return null;
   if (typeof att === 'string') return /^https?:\/\//i.test(att) ? att : null;
@@ -76,41 +76,23 @@ function normalizeUrl(u) {
   return s;
 }
 
-/** Flatten anything Airtable might return for a lookup/attachment field into an array of clean URL strings. */
+/** Flatten attachment/lookup field into array of URLs. */
 function collectPhotoUrls(value) {
   const urls = new Set();
-
   const pushAny = (v) => {
     if (v == null) return;
-
-    if (Array.isArray(v)) {
-      v.forEach(pushAny);
-      return;
-    }
-
+    if (Array.isArray(v)) { v.forEach(pushAny); return; }
     if (typeof v === 'string') {
       const s = v.trim();
-
-      // JSON array/object encoded as string
       if ((s.startsWith('[') && s.endsWith(']')) || (s.startsWith('{') && s.endsWith('}'))) {
-        try {
-          const parsed = JSON.parse(s);
-          pushAny(parsed);
-          return;
-        } catch {
-          // fall through
-        }
+        try { pushAny(JSON.parse(s)); return; } catch {}
       }
-
-      // Comma-joined URLs in one string
-      const parts = s.includes(',') ? s.split(',') : [s];
-      parts.forEach((part) => {
+      (s.includes(',') ? s.split(',') : [s]).forEach((part) => {
         const maybe = pickAttachmentUrl(part);
         if (maybe) urls.add(normalizeUrl(maybe));
       });
       return;
     }
-
     if (typeof v === 'object') {
       if (v.url || v.thumbnails) {
         const maybe = pickAttachmentUrl(v);
@@ -120,179 +102,116 @@ function collectPhotoUrls(value) {
       Object.values(v).forEach(pushAny);
     }
   };
-
   pushAny(value);
   return Array.from(urls);
 }
 
-/** Normalize "Network Leaders Names" into a single comma-separated string. */
+/** Normalize leaders list */
 function normalizeLeaders(value) {
   const parts = [];
-
   const pushClean = (s) => {
     if (s == null) return;
     let t = String(s).trim();
-    t = t.replace(/^(\[|\]+|"+|'+)|(\[|\]+|"+|'+)$/g, ''); // strip quotes/brackets
-    t = t.replace(/\s+/g, ' ').trim();                    // collapse whitespace
-    if (/^rec[a-zA-Z0-9]{14}$/.test(t)) return;           // drop Airtable record IDs
+    t = t.replace(/^(\[|\]+|"+|'+)|(\[|\]+|"+|'+)$/g, '');
+    t = t.replace(/\s+/g, ' ').trim();
+    if (/^rec[a-zA-Z0-9]{14}$/.test(t)) return;
     if (t) parts.push(t);
   };
-
   if (Array.isArray(value)) {
     value.forEach((v) => {
-      if (typeof v === 'object' && v && 'name' in v) {
-        pushClean(v.name);
-      } else if (typeof v === 'string' && v.includes('","')) {
+      if (typeof v === 'object' && v && 'name' in v) pushClean(v.name);
+      else if (typeof v === 'string' && v.includes('","')) {
         v.split('","').forEach((x) => pushClean(x.replace(/^"+|"+$/g, '')));
-      } else {
-        pushClean(v);
-      }
+      } else pushClean(v);
     });
   } else if (typeof value === 'string') {
     const text = value.trim();
     try {
       if (text.startsWith('[') && text.endsWith(']')) {
         const parsed = JSON.parse(text);
-        if (Array.isArray(parsed)) {
-          parsed.forEach(pushClean);
-        } else {
-          pushClean(parsed);
-        }
-      } else {
-        text.split(/[;,]/).forEach((s) => pushClean(s));
-      }
-    } catch {
-      text.split(/[;,]/).forEach((s) => pushClean(s));
-    }
-  } else if (value != null) {
-    pushClean(value);
-  }
-
+        if (Array.isArray(parsed)) parsed.forEach(pushClean); else pushClean(parsed);
+      } else text.split(/[;,]/).forEach(s => pushClean(s));
+    } catch { text.split(/[;,]/).forEach(s => pushClean(s)); }
+  } else if (value != null) pushClean(value);
   return [...new Set(parts)].join(', ');
 }
 
-/** Normalize a general text/lookup field into a comma-separated string (e.g., contact email). */
+/** Normalize text/lookup fields */
 function normalizeTextField(value) {
   if (value == null) return '';
   const out = [];
-
   const pushAny = (v) => {
     if (v == null) return;
-    if (Array.isArray(v)) {
-      v.forEach(pushAny);
-      return;
-    }
+    if (Array.isArray(v)) { v.forEach(pushAny); return; }
     if (typeof v === 'object') {
-      // common shapes: { email: "x@y" } or { text: "..." } or linked { name: "..."}
       const cand = v.email ?? v.text ?? v.name ?? v.value ?? null;
       if (cand != null) {
         const t = String(cand).trim();
         if (t) out.push(t);
-      } else {
-        Object.values(v).forEach(pushAny);
-      }
+      } else Object.values(v).forEach(pushAny);
       return;
     }
     const t = String(v).trim();
     if (t) out.push(t);
   };
-
   pushAny(value);
   return [...new Set(out)].join(', ');
 }
 
-/** Figure out the absolute base URL for proxy links. */
 function getBaseUrl(req) {
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
   const host = req.headers['x-forwarded-host'] || req.get('host');
   return `${proto}://${host}`;
 }
 
-/* ---------------- Image proxies (prevent expired Airtable links) ----------------
-   We proxy ONLY when the source field is an attachment array (objects with url/thumbnails).
-   For plain string URLs (e.g., S3/Cloudinary), we pass them through unchanged.
------------------------------------------------------------------------------ */
-
-/** Very short-lived in-memory cache of fresh Airtable attachment URLs. */
-const urlCache = new Map(); // key: `${field}:${recordId}:${index}` -> { url, expiresAt }
-const CACHE_TTL_MS = 8 * 60 * 1000; // 8 minutes
-
+/* ---------------- Image proxies ---------------- */
+const urlCache = new Map();
+const CACHE_TTL_MS = 8 * 60 * 1000;
 function getCached(key) {
   const v = urlCache.get(key);
   if (!v) return null;
-  if (Date.now() > v.expiresAt) {
-    urlCache.delete(key);
-    return null;
-  }
+  if (Date.now() > v.expiresAt) { urlCache.delete(key); return null; }
   return v.url;
 }
 function setCached(key, url) {
   urlCache.set(key, { url, expiresAt: Date.now() + CACHE_TTL_MS });
 }
 
-/** Redirect to a fresh Airtable attachment URL for Photo[index]. */
 app.get('/img/:recordId/:index', async (req, res) => {
   try {
     const { recordId, index } = req.params;
     const idx = Number(index);
     if (!Number.isInteger(idx) || idx < 0) return res.status(400).send('Bad index');
-
     const cacheKey = `Photo:${recordId}:${idx}`;
     const cached = getCached(cacheKey);
-    if (cached) {
-      res.set('Cache-Control', 'public, max-age=300');
-      return res.redirect(302, cached);
-    }
-
+    if (cached) { res.set('Cache-Control', 'public, max-age=300'); return res.redirect(302, cached); }
     const rec = await fetchRecordById(NETWORKS_TABLE_NAME, recordId);
     const attachments = Array.isArray(rec.fields?.Photo) ? rec.fields.Photo : [];
-    const att = attachments[idx];
-    if (!att) return res.status(404).send('Photo not found');
-
-    const freshUrl = pickAttachmentUrl(att);
-    if (!freshUrl) return res.status(404).send('Photo URL missing');
-
+    const att = attachments[idx]; if (!att) return res.status(404).send('Photo not found');
+    const freshUrl = pickAttachmentUrl(att); if (!freshUrl) return res.status(404).send('Photo URL missing');
     setCached(cacheKey, freshUrl);
-    res.set('Cache-Control', 'public, max-age=300');
-    return res.redirect(302, freshUrl);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).send('Image proxy error');
-  }
+    res.set('Cache-Control', 'public, max-age=300'); return res.redirect(302, freshUrl);
+  } catch (err) { console.error(err); return res.status(500).send('Image proxy error'); }
 });
 
-/** Redirect to a fresh Airtable attachment URL for Image[index]. */
 app.get('/image/:recordId/:index', async (req, res) => {
   try {
     const { recordId, index } = req.params;
     const idx = Number(index);
     if (!Number.isInteger(idx) || idx < 0) return res.status(400).send('Bad index');
-
     const cacheKey = `Image:${recordId}:${idx}`;
     const cached = getCached(cacheKey);
-    if (cached) {
-      res.set('Cache-Control', 'public, max-age=300');
-      return res.redirect(302, cached);
-    }
-
+    if (cached) { res.set('Cache-Control', 'public, max-age=300'); return res.redirect(302, cached); }
     const rec = await fetchRecordById(NETWORKS_TABLE_NAME, recordId);
     const attachments = Array.isArray(rec.fields?.Image) ? rec.fields.Image : [];
-    const att = attachments[idx];
-    if (!att) return res.status(404).send('Image not found');
-
-    const freshUrl = pickAttachmentUrl(att);
-    if (!freshUrl) return res.status(404).send('Image URL missing');
-
+    const att = attachments[idx]; if (!att) return res.status(404).send('Image not found');
+    const freshUrl = pickAttachmentUrl(att); if (!freshUrl) return res.status(404).send('Image URL missing');
     setCached(cacheKey, freshUrl);
-    res.set('Cache-Control', 'public, max-age=300');
-    return res.redirect(302, freshUrl);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).send('Image proxy error');
-  }
+    res.set('Cache-Control', 'public, max-age=300'); return res.redirect(302, freshUrl);
+  } catch (err) { console.error(err); return res.status(500).send('Image proxy error'); }
 });
 
-/** Main endpoint Felt points at */
+/** Main endpoint */
 app.get('/networks.geojson', async (req, res) => {
   try {
     const baseUrl = getBaseUrl(req);
@@ -305,36 +224,28 @@ app.get('/networks.geojson', async (req, res) => {
 
       const leaders = normalizeLeaders(f['Network Leaders Names']) || '';
 
-      /* ----- Photo field handling (existing) ----- */
+      /* ----- Photos ----- */
       let photoUrls = [];
       const photoField = f['Photo'];
       const isPhotoAttachmentArray =
-        Array.isArray(photoField) &&
-        photoField.length > 0 &&
-        typeof photoField[0] === 'object' &&
-        (photoField[0]?.url || photoField[0]?.thumbnails);
-
+        Array.isArray(photoField) && photoField.length > 0 &&
+        typeof photoField[0] === 'object' && (photoField[0]?.url || photoField[0]?.thumbnails);
       if (isPhotoAttachmentArray) {
         photoUrls = photoField.slice(0, 6).map((_, idx) => `${baseUrl}/img/${r.id}/${idx}`);
       } else {
-        const urls = collectPhotoUrls(photoField).map(normalizeUrl);
-        photoUrls = [...new Set(urls)].slice(0, 6);
+        photoUrls = [...new Set(collectPhotoUrls(photoField).map(normalizeUrl))].slice(0, 6);
       }
 
-      /* ----- Image field handling (new) ----- */
+      /* ----- Images ----- */
       let imageUrls = [];
       const imageField = f['Image'];
       const isImageAttachmentArray =
-        Array.isArray(imageField) &&
-        imageField.length > 0 &&
-        typeof imageField[0] === 'object' &&
-        (imageField[0]?.url || imageField[0]?.thumbnails);
-
+        Array.isArray(imageField) && imageField.length > 0 &&
+        typeof imageField[0] === 'object' && (imageField[0]?.url || imageField[0]?.thumbnails);
       if (isImageAttachmentArray) {
         imageUrls = imageField.slice(0, 6).map((_, idx) => `${baseUrl}/image/${r.id}/${idx}`);
       } else {
-        const urls = collectPhotoUrls(imageField).map(normalizeUrl);
-        imageUrls = [...new Set(urls)].slice(0, 6);
+        imageUrls = [...new Set(collectPhotoUrls(imageField).map(normalizeUrl))].slice(0, 6);
       }
 
       const [photo1 = '', photo2 = '', photo3 = '', photo4 = '', photo5 = '', photo6 = ''] = photoUrls;
@@ -342,38 +253,28 @@ app.get('/networks.geojson', async (req, res) => {
       const photo_count = photoUrls.filter(Boolean).length;
       const image_count = imageUrls.filter(Boolean).length;
 
-      // contact email field (supports common name variants & lookups)
-      const contact_email = normalizeTextField(
-        f['contact email'] ?? f['Contact Email'] ?? f['Contact email']
-      );
-
-      // additional attributes requested
-      const status = normalizeTextField(f['Status']);
-      const county = normalizeTextField(f['County']);
-      const tags = normalizeTextField(f['Tags']);
-      const number_of_churches = f['Number of Churches'] ?? '';
-
       return {
         type: 'Feature',
         geometry,
         properties: {
           id: r.id,
           name: f['Network Name'] ?? '',
-          leaders,                // string
-          contact_email,          // string
-          status,                 // string
-          county,                 // string
-          tags,                   // string (comma-joined if multiple)
-          number_of_churches,     // likely numeric; left as-is
+          leaders,
+          contact_email: normalizeTextField(f['contact email'] ?? f['Contact Email'] ?? f['Contact email']),
+          status: normalizeTextField(f['Status']),
+          county: normalizeTextField(f['County']),
+          tags: normalizeTextField(f['Tags']),
+          number_of_churches: f['Number of Churches'] ?? '',
+          unity_lead: normalizeTextField(f['Unity Lead']),
           photo1, photo2, photo3, photo4, photo5, photo6,
-          photo_count,            // integer 0..6
+          photo_count,
           image1, image2, image3, image4, image5, image6,
-          image_count,            // integer 0..6
+          image_count,
         },
       };
     }).filter(Boolean);
 
-    res.set('Cache-Control', 'public, max-age=300'); // 5 minutes
+    res.set('Cache-Control', 'public, max-age=300');
     res.json({ type: 'FeatureCollection', features });
   } catch (err) {
     console.error(err);
@@ -382,7 +283,4 @@ app.get('/networks.geojson', async (req, res) => {
 });
 
 app.get('/', (_req, res) => res.send('OK'));
-
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => { console.log(`Server running on http://localhost:${PORT}`); });
