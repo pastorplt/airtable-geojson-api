@@ -70,9 +70,9 @@ function pickAttachmentUrl(att) {
 /** Normalize weird slashes and leading encodings in a URL string. */
 function normalizeUrl(u) {
   let s = String(u || '').trim();
-  s = s.replace(/^%20+/i, '').replace(/^\s+/, '');          // trim encoded/real spaces
-  s = s.replace(/^(https?:)\/{2,}/i, (_, p1) => `${p1}//`); // https://// -> https://
-  s = s.replace(/([^:])\/{2,}/g, '$1/');                    // collapse extra slashes in path
+  s = s.replace(/^%20+/i, '').replace(/^\s+/, '');
+  s = s.replace(/^(https?:)\/{2,}/i, (_, p1) => `${p1}//`);
+  s = s.replace(/([^:])\/{2,}/g, '$1/');
   return s;
 }
 
@@ -97,7 +97,9 @@ function collectPhotoUrls(value) {
           const parsed = JSON.parse(s);
           pushAny(parsed);
           return;
-        } catch { /* fall through */ }
+        } catch {
+          // fall through
+        }
       }
 
       // Comma-joined URLs in one string
@@ -138,22 +140,29 @@ function normalizeLeaders(value) {
 
   if (Array.isArray(value)) {
     value.forEach((v) => {
-      if (typeof v === 'object' && v && 'name' in v) pushClean(v.name);
-      else if (typeof v === 'string' && v.includes('","')) {
-        v.split('","').forEach(x => pushClean(x.replace(/^"+|"+$/g, '')));
-      } else pushClean(v);
+      if (typeof v === 'object' && v && 'name' in v) {
+        pushClean(v.name);
+      } else if (typeof v === 'string' && v.includes('","')) {
+        v.split('","').forEach((x) => pushClean(x.replace(/^"+|"+$/g, '')));
+      } else {
+        pushClean(v);
+      }
     });
   } else if (typeof value === 'string') {
     const text = value.trim();
     try {
       if (text.startsWith('[') && text.endsWith(']')) {
         const parsed = JSON.parse(text);
-        if (Array.isArray(parsed)) parsed.forEach(pushClean); else pushClean(parsed);
+        if (Array.isArray(parsed)) {
+          parsed.forEach(pushClean);
+        } else {
+          pushClean(parsed);
+        }
       } else {
-        text.split(/[;,]/).forEach(s => pushClean(s));
+        text.split(/[;,]/).forEach((s) => pushClean(s));
       }
     } catch {
-      text.split(/[;,]/).forEach(s => pushClean(s));
+      text.split(/[;,]/).forEach((s) => pushClean(s));
     }
   } else if (value != null) {
     pushClean(value);
@@ -162,7 +171,7 @@ function normalizeLeaders(value) {
   return [...new Set(parts)].join(', ');
 }
 
-/** NEW: Normalize a general text/lookup field into a comma-separated string (e.g., contact email). */
+/** Normalize a general text/lookup field into a comma-separated string (e.g., contact email). */
 function normalizeTextField(value) {
   if (value == null) return '';
   const out = [];
@@ -199,13 +208,13 @@ function getBaseUrl(req) {
   return `${proto}://${host}`;
 }
 
-/* ---------------- Image proxy (prevents expired Airtable links) ----------------
-   - We proxy ONLY when the Photo field is an attachment array (objects with url/thumbnails).
-   - For plain string URLs (e.g., S3/Cloudinary), we pass them through unchanged.
+/* ---------------- Image proxies (prevent expired Airtable links) ----------------
+   We proxy ONLY when the source field is an attachment array (objects with url/thumbnails).
+   For plain string URLs (e.g., S3/Cloudinary), we pass them through unchanged.
 ----------------------------------------------------------------------------- */
 
 /** Very short-lived in-memory cache of fresh Airtable attachment URLs. */
-const urlCache = new Map(); // key: `${recordId}:${index}` -> { url, expiresAt }
+const urlCache = new Map(); // key: `${field}:${recordId}:${index}` -> { url, expiresAt }
 const CACHE_TTL_MS = 8 * 60 * 1000; // 8 minutes
 
 function getCached(key) {
@@ -228,7 +237,7 @@ app.get('/img/:recordId/:index', async (req, res) => {
     const idx = Number(index);
     if (!Number.isInteger(idx) || idx < 0) return res.status(400).send('Bad index');
 
-    const cacheKey = `${recordId}:${idx}`;
+    const cacheKey = `Photo:${recordId}:${idx}`;
     const cached = getCached(cacheKey);
     if (cached) {
       res.set('Cache-Control', 'public, max-age=300');
@@ -252,6 +261,37 @@ app.get('/img/:recordId/:index', async (req, res) => {
   }
 });
 
+/** Redirect to a fresh Airtable attachment URL for Image[index]. */
+app.get('/image/:recordId/:index', async (req, res) => {
+  try {
+    const { recordId, index } = req.params;
+    const idx = Number(index);
+    if (!Number.isInteger(idx) || idx < 0) return res.status(400).send('Bad index');
+
+    const cacheKey = `Image:${recordId}:${idx}`;
+    const cached = getCached(cacheKey);
+    if (cached) {
+      res.set('Cache-Control', 'public, max-age=300');
+      return res.redirect(302, cached);
+    }
+
+    const rec = await fetchRecordById(NETWORKS_TABLE_NAME, recordId);
+    const attachments = Array.isArray(rec.fields?.Image) ? rec.fields.Image : [];
+    const att = attachments[idx];
+    if (!att) return res.status(404).send('Image not found');
+
+    const freshUrl = pickAttachmentUrl(att);
+    if (!freshUrl) return res.status(404).send('Image URL missing');
+
+    setCached(cacheKey, freshUrl);
+    res.set('Cache-Control', 'public, max-age=300');
+    return res.redirect(302, freshUrl);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send('Image proxy error');
+  }
+});
+
 /** Main endpoint Felt points at */
 app.get('/networks.geojson', async (req, res) => {
   try {
@@ -265,32 +305,53 @@ app.get('/networks.geojson', async (req, res) => {
 
       const leaders = normalizeLeaders(f['Network Leaders Names']) || '';
 
-      // If Photo is an attachment array (objects), build proxied URLs by index.
+      /* ----- Photo field handling (existing) ----- */
       let photoUrls = [];
       const photoField = f['Photo'];
-      const isAttachmentArray =
+      const isPhotoAttachmentArray =
         Array.isArray(photoField) &&
         photoField.length > 0 &&
         typeof photoField[0] === 'object' &&
         (photoField[0]?.url || photoField[0]?.thumbnails);
 
-      if (isAttachmentArray) {
-        photoUrls = photoField
-          .slice(0, 6)
-          .map((_, idx) => `${baseUrl}/img/${r.id}/${idx}`);
+      if (isPhotoAttachmentArray) {
+        photoUrls = photoField.slice(0, 6).map((_, idx) => `${baseUrl}/img/${r.id}/${idx}`);
       } else {
-        // Fallback: collect plain URLs from whatever is in Photo (these may be permanent)
         const urls = collectPhotoUrls(photoField).map(normalizeUrl);
         photoUrls = [...new Set(urls)].slice(0, 6);
       }
 
-      const [photo1 = '', photo2 = '', photo3 = '', photo4 = '', photo5 = '', photo6 = ''] = photoUrls;
-      const photo_count = photoUrls.filter(Boolean).length;
+      /* ----- Image field handling (new) ----- */
+      let imageUrls = [];
+      const imageField = f['Image'];
+      const isImageAttachmentArray =
+        Array.isArray(imageField) &&
+        imageField.length > 0 &&
+        typeof imageField[0] === 'object' &&
+        (imageField[0]?.url || imageField[0]?.thumbnails);
 
-      // NEW: contact email field (supports common name variants & lookups)
+      if (isImageAttachmentArray) {
+        imageUrls = imageField.slice(0, 6).map((_, idx) => `${baseUrl}/image/${r.id}/${idx}`);
+      } else {
+        const urls = collectPhotoUrls(imageField).map(normalizeUrl);
+        imageUrls = [...new Set(urls)].slice(0, 6);
+      }
+
+      const [photo1 = '', photo2 = '', photo3 = '', photo4 = '', photo5 = '', photo6 = ''] = photoUrls;
+      const [image1 = '', image2 = '', image3 = '', image4 = '', image5 = '', image6 = ''] = imageUrls;
+      const photo_count = photoUrls.filter(Boolean).length;
+      const image_count = imageUrls.filter(Boolean).length;
+
+      // contact email field (supports common name variants & lookups)
       const contact_email = normalizeTextField(
         f['contact email'] ?? f['Contact Email'] ?? f['Contact email']
       );
+
+      // additional attributes requested
+      const status = normalizeTextField(f['Status']);
+      const county = normalizeTextField(f['County']);
+      const tags = normalizeTextField(f['Tags']);
+      const number_of_churches = f['Number of Churches'] ?? '';
 
       return {
         type: 'Feature',
@@ -298,15 +359,16 @@ app.get('/networks.geojson', async (req, res) => {
         properties: {
           id: r.id,
           name: f['Network Name'] ?? '',
-          leaders,        // single comma-separated string
-          contact_email,  // <-- added
-          photo1,
-          photo2,
-          photo3,
-          photo4,
-          photo5,
-          photo6,
-          photo_count,    // integer 0..6
+          leaders,                // string
+          contact_email,          // string
+          status,                 // string
+          county,                 // string
+          tags,                   // string (comma-joined if multiple)
+          number_of_churches,     // likely numeric; left as-is
+          photo1, photo2, photo3, photo4, photo5, photo6,
+          photo_count,            // integer 0..6
+          image1, image2, image3, image4, image5, image6,
+          image_count,            // integer 0..6
         },
       };
     }).filter(Boolean);
